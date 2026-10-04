@@ -2,58 +2,113 @@ workflows:
   android-workflow:
     name: Dream Live - Android
     max_build_duration: 45
-    instance_type: linux_x2
+    instance_type: mac_mini_m1
     environment:
       vars:
-        GODOT_VERSION: "4.3-stable"
+        GODOT_VERSION: "4.3"
+        GODOT_RELEASE: "4.3-stable"
     scripts:
-      - name: Godot dvijogini yuklab olish
+      - name: Загрузка и установка шаблонов экспорта Godot
         script: |
-          curl -sL -o godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
-          unzip -q godot.zip
-          chmod +x Godot_v${GODOT_VERSION}_linux.x86_64
-          mv Godot_v${GODOT_VERSION}_linux.x86_64 /usr/local/bin/godot
+          mkdir -p ~/Library/Application\ Support/Godot/export_templates/${GODOT_VERSION}.stable
+          curl --retry 5 --retry-delay 5 -L -o templates.tpz \
+            "https://github.com/godotengine/godot/releases/download/${GODOT_RELEASE}/Godot_v${GODOT_RELEASE}_export_templates.tpz"
 
-      - name: Export shablonlarini yuklab olish
+          if ! unzip -t templates.tpz > /dev/null 2>&1; then
+            echo "templates.tpz повреждён, повторная загрузка..."
+            python3 -c "import urllib.request; urllib.request.urlretrieve('https://github.com/godotengine/godot/releases/download/${GODOT_RELEASE}/Godot_v${GODOT_RELEASE}_export_templates.tpz', 'templates.tpz')"
+          fi
+
+          unzip templates.tpz
+          mv templates/* ~/Library/Application\ Support/Godot/export_templates/${GODOT_VERSION}.stable/
+          rm -rf templates templates.tpz
+          echo "=== Установленные шаблоны ==="
+          ls -la ~/Library/Application\ Support/Godot/export_templates/${GODOT_VERSION}.stable/
+
+      - name: Загрузка консольной версии Godot для macOS
         script: |
-          mkdir -p ~/.local/share/godot/export_templates/${GODOT_VERSION}
-          curl -sL -o templates.tpz "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_export_templates.tpz"
-          unzip -q templates.tpz -d /tmp/templates
-          mv /tmp/templates/templates/* ~/.local/share/godot/export_templates/${GODOT_VERSION}/
+          curl --retry 7 --retry-delay 3 -L -o godot.zip \
+            "https://github.com/godotengine/godot/releases/download/${GODOT_RELEASE}/Godot_v${GODOT_RELEASE}_macos.universal.zip"
 
-      - name: Debug keystore yaratish
+          if ! unzip -t godot.zip > /dev/null 2>&1; then
+            echo "godot.zip повреждён, повторная загрузка..."
+            python3 -c "import urllib.request; urllib.request.urlretrieve('https://github.com/godotengine/godot/releases/download/${GODOT_RELEASE}/Godot_v${GODOT_RELEASE}_macos.universal.zip', 'godot.zip')"
+          fi
+
+          unzip godot.zip
+          EXEC_PATH=$(find . -type f -path "*MacOS/Godot" | head -n 1)
+          if [ -n "$EXEC_PATH" ]; then
+            cp "$EXEC_PATH" ./godot_engine
+            chmod +x ./godot_engine
+
+            # Снятие карантина macOS Gatekeeper для запуска без ошибок
+            xattr -dr com.apple.quarantine ./godot_engine 2>/dev/null || true
+            codesign -s - --force --deep ./godot_engine 2>/dev/null || true
+
+            echo "Godot извлечён и подготовлен."
+            ./godot_engine --version || true
+          else
+            echo "КРИТИЧЕСКАЯ ОШИБКА: Исполняемый файл не найден!"
+            exit 1
+          fi
+          rm -rf Godot.app godot.zip
+
+      - name: Создание debug keystore для Android
         script: |
-          keytool -genkey -v -keystore $HOME/debug.keystore -storepass android \
-            -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
-            -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          mkdir -p $HOME/.android
+          if [ -z "$JAVA_HOME" ]; then
+            export JAVA_HOME=$(/usr/libexec/java_home -v 17 2>/dev/null || /usr/libexec/java_home)
+          fi
+          echo "JAVA_HOME=$JAVA_HOME"
+          "$JAVA_HOME/bin/keytool" -genkeypair -v \
+            -keystore $HOME/.android/debug.keystore \
+            -storepass android -keypass android \
+            -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US" 2>/dev/null || true
+          echo "Debug keystore создан."
 
-      - name: Android SDK yo'lini Godot'ga ko'rsatish
+      - name: Настройка путей Android SDK в Godot
         script: |
           mkdir -p ~/.config/godot
           SDK_PATH="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
           JAVA_PATH="${JAVA_HOME}"
+
           cat > ~/.config/godot/editor_settings-4.3.tres << SETTINGS
           [gd_resource type="EditorSettings" format=3]
 
           [resource]
           export/android/java_sdk_path = "$JAVA_PATH"
           export/android/android_sdk_path = "$SDK_PATH"
-          export/android/debug_keystore = "$HOME/debug.keystore"
+          export/android/debug_keystore = "$HOME/.android/debug.keystore"
           export/android/debug_keystore_user = "androiddebugkey"
           export/android/debug_keystore_pass = "android"
           SETTINGS
+          echo "Editor settings созданы."
 
-      - name: Loyihani import qilish
+      - name: Импорт проекта
         script: |
-          godot --headless --path . --import
+          # Указан путь к подпапке игры dreamcore_game
+          ./godot_engine --headless --path dreamcore_game --import || true
+          echo "Импорт завершён."
 
-      - name: APK yig'ish
+      - name: Создание директории для сборки
         script: |
-          mkdir -p build
-          godot --headless --path . --export-debug "Android" build/DreamLive.apk
+          mkdir -p dreamcore_game/build
+
+      - name: Сборка Android APK (Debug)
+        script: |
+          echo "=== Пресеты проекта ==="
+          grep -E '^\[preset\.|^name=' dreamcore_game/export_presets.cfg || true
+          
+          # Сборка из подпапки с выводом готового APK в её внутренний каталог build
+          ./godot_engine --headless --path dreamcore_game --export-debug "Android" dreamcore_game/build/DreamLive.apk
+          
+          echo "=== Результат ==="
+          ls -la dreamcore_game/build/
 
     artifacts:
-      - build/*.apk
+      - dreamcore_game/build/*.apk
 
     publishing:
       email:
